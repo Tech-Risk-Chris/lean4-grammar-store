@@ -1,0 +1,10 @@
+name = "grammar-store"
+version = "0.1.0"
+defaultTargets = ["grammar-store"]
+
+[[lean_lib]]
+name = "GrammarStore"
+
+[[lean_exe]]
+name = "grammar-store"
+root = "Main"
