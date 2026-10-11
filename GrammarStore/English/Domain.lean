@@ -4,27 +4,31 @@ import GrammarStore.English.Morphology
 /-!
 # English past tense as a grammar-store domain
 
+## Scope
+The checker's expertise is the simple past and the present perfect. Its
+standing assumption: every input contains at least one verb form of that
+kind. If it finds none, the answer is *out of scope*, not *ok*.
+
 ## Queries
 Every question a rule may ask is keyed, so a cached answer's label names
-exactly what it relied on:
+exactly what it relied on. Questions sharing a key are merged (that costs no
+locality); questions with different keys stay apart.
 
-* `verb b`     — the lexical status of lemma `b`: irregular entry, regular, or absent.
-* `readings w` — the lemmas whose attempted forms include the surface form `w`.
-  This is the derived index that fixes the `wound` problem: a label records
-  "the readings of *wound* were exactly these", and a new layer invalidates it
-  iff it changes that set — including by adding a lemma like `wind`.
-* `aux w`      — the slot an auxiliary opens, if `w` is one.
-* `reset w`    — whether `w` closes a clause.
+* `verb b`     — keyed by lemma: irregular entry, regular, or absent.
+* `classify w` — keyed by surface form: the word's closed-class memberships
+  (pronoun, noun, copula, auxiliary, …) from the layers, plus its verb
+  readings (lemmas whose attempted forms include `w` — the derived index
+  that fixes the `wound` problem).
 
 ## Layers
-Newest first. For a lemma, the newest layer that mentions it decides:
-retraction, an irregular entry, or a regular listing. So a layer may override
-(US `dive/dove` over base `dive`), and a correction is a layer, not an edit.
+Newest first. For a lemma, the newest layer that mentions it decides
+(retraction, irregular entry, regular listing). For a word's classes, the
+newest layer that lists the word decides. Overrides and corrections are
+layers, not edits.
 
 ## Three-valued lexicon
 The weak rule applies only to lemmas the lexicon lists as regular. An unknown
-verb gets *no* past (`none`), not a guess — that is what makes "absent" an
-honest, recordable assumption instead of a default that silently fires.
+verb gets *no* past (`none`), not a guess.
 -/
 
 namespace GrammarStore.English
@@ -46,36 +50,47 @@ def formFrom (sel : Irregular → String) (b : String) : Status → Option Strin
   | .regular     => some (weakPast b)
   | .absent      => none
 
+/-! ## Word classes -/
+
+inductive WordClass where
+  | aux (s : Slot) (past : Bool)   -- have/has/had, do/does/did
+  | copula (past : Bool)           -- forms of be; open a participle slot
+  | conj                           -- closes a clause
+  | pronoun
+  | determiner
+  | preposition
+  | adverb
+  | noun
+deriving Repr, DecidableEq
+
+structure Analysis where
+  classes  : List WordClass
+  readings : List String
+deriving Repr, DecidableEq
+
 /-! ## The query interface -/
 
 inductive Q where
   | verb     (b : String)
-  | readings (w : String)
-  | aux      (w : String)
-  | reset    (w : String)
+  | classify (w : String)
 deriving Repr, DecidableEq
 
 def Q.A : Q → Type
   | .verb _     => Status
-  | .readings _ => List String
-  | .aux _      => Option Slot
-  | .reset _    => Bool
+  | .classify _ => Analysis
 
 instance instDecEqA : (q : Q) → DecidableEq q.A
   | .verb _     => inferInstanceAs (DecidableEq Status)
-  | .readings _ => inferInstanceAs (DecidableEq (List String))
-  | .aux _      => inferInstanceAs (DecidableEq (Option Slot))
-  | .reset _    => inferInstanceAs (DecidableEq Bool)
+  | .classify _ => inferInstanceAs (DecidableEq Analysis)
 
 /-! ## Layers and the oracle -/
 
 structure Layer where
-  name        : String := ""
-  irregulars  : List Irregular := []
-  regulars    : List String := []
-  retract     : List String := []
-  auxiliaries : List (String × Slot) := []
-  resets      : List String := []
+  name       : String := ""
+  irregulars : List Irregular := []
+  regulars   : List String := []
+  retract    : List String := []
+  words      : List (String × List WordClass) := []
 deriving Repr
 
 def statusIn : List Layer → String → Status
@@ -99,17 +114,12 @@ def attemptsIn (ls : List Layer) (v : String) : List String :=
 def readingsIn (ls : List Layer) (w : String) : List String :=
   (lemmasIn ls).filter fun v => (attemptsIn ls v).contains w
 
-def auxIn (ls : List Layer) (w : String) : Option Slot :=
-  ls.findSome? fun l => List.lookup w l.auxiliaries
-
-def resetIn (ls : List Layer) (w : String) : Bool :=
-  ls.any fun l => l.resets.contains w
+def classesIn (ls : List Layer) (w : String) : List WordClass :=
+  (ls.findSome? fun l => List.lookup w l.words).getD []
 
 def answer (ls : List Layer) : (q : Q) → q.A
   | .verb b     => statusIn ls b
-  | .readings w => readingsIn ls w
-  | .aux w      => auxIn ls w
-  | .reset w    => resetIn ls w
+  | .classify w => ⟨classesIn ls w, readingsIn ls w⟩
 
 /-! ## Rules -/
 
@@ -123,10 +133,8 @@ deriving Repr
 
 abbrev G := Prog Q Q.A Rule
 
-def verbQ     (b : String) : G Status        := .ask (.verb b) fun x => .pure x
-def readingsQ (w : String) : G (List String) := .ask (.readings w) fun x => .pure x
-def auxQ      (w : String) : G (Option Slot) := .ask (.aux w) fun x => .pure x
-def resetQ    (w : String) : G Bool          := .ask (.reset w) fun x => .pure x
+def verbQ     (b : String) : G Status   := .ask (.verb b) fun x => .pure x
+def classifyQ (w : String) : G Analysis := .ask (.classify w) fun x => .pure x
 
 def explain (b : String) : Status → G Unit
   | .irregular v => Prog.because (.table b v)
@@ -173,37 +181,7 @@ def checkWord (slot : Slot) (v w : String) : G (Option String) := do
       | _            => false
     pure (some (diagnose slot irr v w expected past pp))
 
-/-- Left-to-right scan. An auxiliary opens a slot that the next verb fills;
-the verb, or a clause boundary, closes it. An ambiguous word is an error only
-if *every* reading is wrong. -/
-def checkProg (s : String) : G (List String) := do
-  let mut slot := Slot.finite
-  let mut errs : List String := []
-  for w in tokens s do
-    match (← auxQ w) with
-    | some sl =>
-      Prog.because (.auxiliary w sl)
-      slot := sl
-    | none =>
-      if (← resetQ w) then
-        Prog.because (.boundary w)
-        slot := .finite
-      else
-        match (← readingsQ w) with
-        | [] => pure ()
-        | [v] =>
-          errs := errs ++ (← checkWord slot v w).toList
-          slot := .finite
-        | vs =>
-          Prog.because (.ambiguous w vs)
-          let results ← vs.mapM (checkWord slot · w)
-          if results.all Option.isSome then
-            errs := errs ++ (results.head?.join.toList.map
-              (· ++ s!" [readings: {", ".intercalate vs}]"))
-          slot := .finite
-  return errs
-
-/-! ## Goals, answers, display -/
+/-! ## Goals and answers -/
 
 inductive Goal where
   | past  (b : String)
@@ -212,48 +190,116 @@ inductive Goal where
 deriving Repr, DecidableEq
 
 inductive Ans where
-  | form   (p : Option String)
-  | errors (es : List String)
+  | form       (p : Option String)
+  | checked    (errors unknown : List String)
+  | outOfScope (unknown : List String)
 deriving Repr, DecidableEq
+
+/-- The slot an auxiliary or copula opens, and whether it is itself past. -/
+def auxOf (cs : List WordClass) : Option (Slot × Bool) :=
+  cs.findSome? fun
+    | .aux s p  => some (s, p)
+    | .copula p => some (.participle, p)
+    | _         => none
+
+/-- Left-to-right scan. An auxiliary opens a slot that the next verb fills
+(so inversion works: "did you went"); the verb, or a conjunction, closes it.
+
+A verb form *counts toward scope* if it fills an auxiliary's slot or is not
+the bare base form, i.e. it is past-shaped, right or wrong. A past auxiliary
+left without a verb ("I had the book", "she was happy") counts as well.
+
+An ambiguous word is an error only if every verb reading is wrong and it has
+no noun reading. -/
+def checkProg (s : String) : G Ans := do
+  let mut slot := Slot.finite
+  let mut pending : Option Bool := none     -- an open auxiliary slot; `true` if the auxiliary is past
+  let mut errs : List String := []
+  let mut unknown : List String := []
+  let mut sawVerb := false
+  for w in tokens s do
+    let a ← classifyQ w
+    match auxOf a.classes with
+    | some (sl, past) =>
+      Prog.because (.auxiliary w sl)
+      if pending == some true then sawVerb := true
+      slot := sl
+      pending := some past
+    | none =>
+      if a.classes.contains .conj then
+        Prog.because (.boundary w)
+        if pending == some true then sawVerb := true
+        slot := .finite
+        pending := none
+      else
+        match a.readings with
+        | [] =>
+          if a.classes.isEmpty then unknown := unknown ++ [w]
+        | vs =>
+          if vs.length > 1 then Prog.because (.ambiguous w vs)
+          let results ← vs.mapM (checkWord slot · w)
+          if results.all Option.isSome && !a.classes.contains .noun then
+            errs := errs ++ (results.head?.join.toList.map fun e =>
+              if vs.length > 1 then e ++ s!" [readings: {", ".intercalate vs}]" else e)
+          if vs.any (fun v => slot != .finite || w != v) then sawVerb := true
+          slot := .finite
+          pending := none
+  if pending == some true then sawVerb := true
+  if sawVerb then return .checked errs unknown
+  else return .outOfScope unknown
+
+/-! ## Display -/
 
 def showGoal : Goal → String
   | .past b  => s!"past {b}"
   | .pp b    => s!"pp {b}"
   | .check s => s!"check \"{s}\""
 
+def endsInEd (w : String) : Bool := w.toList.reverse.take 2 == ['d', 'e']
+
 def showAns : Ans → String
   | .form (some p) => p
   | .form none     => "(no judgment: verb not in lexicon)"
-  | .errors []     => "ok"
-  | .errors es     => "\n".intercalate es
+  | .checked es us =>
+    let body := if es.isEmpty then ["ok"] else es
+    let unchecked := if us.isEmpty then [] else [s!"unchecked: {", ".intercalate us}"]
+    "\n".intercalate (body ++ unchecked)
+  | .outOfScope us =>
+    let hints := (us.filter endsInEd).map fun w =>
+      s!"'{w}' looks like the past of a verb not in the lexicon"
+    let unk := if us.isEmpty then [] else [s!"unknown: {", ".intercalate us}"]
+    "\n".intercalate (["not my expertise: no past or present-perfect verb form found"] ++ hints ++ unk)
+
+def showClass : WordClass → String
+  | .aux s p     => (if p then "past " else "") ++ s!"auxiliary ({showSlot s})"
+  | .copula p    => if p then "past copula" else "copula"
+  | .conj        => "conjunction"
+  | .pronoun     => "pronoun"
+  | .determiner  => "determiner"
+  | .preposition => "preposition"
+  | .adverb      => "adverb"
+  | .noun        => "noun"
 
 def showStatus : Status → String
   | .irregular v => s!"irregular {v.past}/{v.pp}"
   | .regular     => "regular"
   | .absent      => "not in lexicon"
 
-def showReadings (w : String) (vs : List String) : String :=
-  if vs.isEmpty then s!"'{w}' is not a verb form" else s!"'{w}' reads as {", ".intercalate vs}"
-
-def showAux (w : String) : Option Slot → String
-  | some s => s!"'{w}' opens a {showSlot s} slot"
-  | none   => s!"'{w}' is not an auxiliary"
-
-def showReset (w : String) (b : Bool) : String :=
-  if b then s!"'{w}' closes a clause" else s!"'{w}' does not close a clause"
+def showAnalysis (w : String) (a : Analysis) : String :=
+  let parts := a.classes.map showClass ++
+    (if a.readings.isEmpty then [] else [s!"form of {"/".intercalate a.readings}"])
+  s!"'{w}': " ++ (if parts.isEmpty then "unknown" else ", ".intercalate parts)
 
 def showAsked : (q : Q) → q.A → String
-  | .verb b, st     => s!"{b} is {showStatus st}"
-  | .readings w, vs => showReadings w vs
-  | .aux w, a       => showAux w a
-  | .reset w, b     => showReset w b
+  | .verb b, st     => s!"{b}: " ++ showStatus st
+  | .classify w, a  => showAnalysis w a
 
 def showRule : Rule → String
-  | .table b v       => s!"{b}: table entry {v.base}/{v.past}/{v.pp}"
-  | .weak b          => s!"{b}: weak rule"
-  | .auxiliary w s   => s!"'{w}' opens a {showSlot s} slot"
-  | .boundary w      => s!"'{w}' closes the clause"
-  | .ambiguous w vs  => s!"'{w}' is ambiguous: {", ".intercalate vs}"
+  | .table b v      => s!"{b}: table entry {v.base}/{v.past}/{v.pp}"
+  | .weak b         => s!"{b}: weak rule"
+  | .auxiliary w s  => s!"'{w}' opens a {showSlot s} slot"
+  | .boundary w     => s!"'{w}' closes the clause"
+  | .ambiguous w vs => s!"'{w}' is ambiguous: {", ".intercalate vs}"
 
 def showEvent : Event Q Q.A Rule → String
   | .asked q a => showAsked q a
@@ -272,7 +318,7 @@ def showEvent : Event Q Q.A Rule → String
   prog := fun
     | .past b  => Ans.form <$> formOf Irregular.past b
     | .pp b    => Ans.form <$> formOf Irregular.pp b
-    | .check s => Ans.errors <$> checkProg s
+    | .check s => checkProg s
   decA := instDecEqA
   decGoal := inferInstance
   showEvent := showEvent
@@ -306,7 +352,10 @@ theorem PastOf.unique {ls : List Layer} {b p q : String}
   cases hp.symm.trans hq
   rfl
 
-/-! ## The base grammar and a US branch -/
+/-! ## The base grammar and some layers to push -/
+
+def tagAll (c : WordClass) (ws : List String) : List (String × List WordClass) :=
+  ws.map (·, [c])
 
 def baseLayer : Layer where
   name := "base"
@@ -328,11 +377,26 @@ def baseLayer : Layer where
   regulars :=
     [ "walk", "stop", "carry", "play", "bake", "visit", "plan", "want", "box", "kick"
     , "fix", "snow", "learn", "dive", "wound" ]
-  auxiliaries :=
-    (["have", "has", "had", "having", "be", "is", "are", "was", "were", "been", "being"].map
-      (·, Slot.participle)) ++
-    (["do", "does", "did"].map (·, Slot.bare))
-  resets := ["and", "but", "then", "or", "no", "yes"]
+  words :=
+    tagAll (.aux .participle false) ["have", "has", "having"] ++
+    tagAll (.aux .participle true)  ["had"] ++
+    tagAll (.copula false) ["be", "am", "is", "are", "been", "being"] ++
+    tagAll (.copula true)  ["was", "were"] ++
+    tagAll (.aux .bare false) ["do", "does"] ++
+    tagAll (.aux .bare true)  ["did"] ++
+    tagAll .conj ["and", "but", "then", "or", "no", "yes"] ++
+    tagAll .pronoun
+      ["i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them",
+       "nothing", "something", "everything", "who", "what"] ++
+    tagAll .determiner
+      ["the", "a", "an", "this", "that", "these", "those", "my", "your", "his", "its", "our",
+       "their", "all", "three"] ++
+    tagAll .preposition ["in", "on", "at", "to", "from", "with", "by", "into", "of", "for"] ++
+    tagAll .adverb
+      ["yesterday", "away", "home", "loudly", "seriously", "first", "already", "never", "not"] ++
+    tagAll .noun
+      ["book", "letter", "student", "apples", "class", "wine", "choir", "bags", "times", "pool",
+       "clock"]
 
 def usLayer : Layer :=
   { name := "us", irregulars := [⟨"dive", "dove", "dived", .strong⟩] }
@@ -352,19 +416,23 @@ example : PastOf [usLayer, baseLayer] "dive" "dove"     := by decide +kernel
 example : (formOf Irregular.past "blorf").run (answer [baseLayer]) = none := by decide +kernel
 
 def demo : IO Unit := do
-  let s := Session.init base
-  let (e1, s) := s.ask (Goal.check "She dived in and teached us.")
-  IO.println e1.render
-  let (e2, s) := s.ask (Goal.past "teach")
-  IO.println e2.render
-  let (e3, s) := s.ask (Goal.check "The wound healed.")
-  IO.println e3.render
+  let mut s := Session.init base
+  for sentence in
+      [ "She teached us and we have learned nothing."
+      , "I have ran three times and he has put it away."
+      , "They sung loudly, then the choir had drank all the wine."
+      , "We stoped, carryed the bags, and played."
+      , "Did you went? No, I did go yesterday and taught the class."
+      , "I had the book and ran home; have you seen it?"
+      , "The letter was wrote by a student who bringed apples."
+      , "They fighted seriously."
+      , "They walk home."
+      , "She was happy." ] do
+    let (e, s') := s.ask (Goal.check sentence)
+    s := s'
+    IO.println s!"» {sentence}\n{e.render}\n"
   let r := s.push usLayer
-  IO.println s!"\n+us: kept {r.kept.length}, dropped {r.dropped.map (showGoal ·.goal)}"
-  let r := r.session.push windLayer
-  IO.println s!"+wind: kept {r.kept.length}, dropped {r.dropped.map (showGoal ·.goal)}"
-  let (e4, _) := r.session.ask (Goal.check "She dived in and teached us.")
-  IO.println e4.render
+  IO.println s!"+us: kept {r.kept.length}, dropped {r.dropped.map (showGoal ·.goal)}"
 
 #eval demo
 

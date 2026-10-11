@@ -84,7 +84,9 @@ def rules (e : Entry D) : List (Event D.Q D.A D.R) := e.trace.filter (fun ev => 
 def render (e : Entry D) : String :=
   let because  := (e.rules.map D.showEvent).eraseDups
   let assuming := (e.label.map D.showEvent).eraseDups
-  s!"{D.showAns e.ans}\n  because:  {"; ".intercalate because}\n  assuming: {"; ".intercalate assuming}"
+  let sec (name : String) (xs : List String) : String :=
+    if xs.isEmpty then "" else s!"\n  {name}{"; ".intercalate xs}"
+  D.showAns e.ans ++ sec "because:  " because ++ sec "assuming: " assuming
 
 theorem record_holds (kb : KB D) (g : D.Goal) : (record kb g).Holds kb := rfl
 

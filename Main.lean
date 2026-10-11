@@ -9,7 +9,9 @@ alone. `serve.py` puts HTTP in front of it.
     past <verb>            pp <verb>            check <sentence>
     irregular <base> <past> <pp> <strong|weakIrreg|suppletive>
     regular <verb>         retract <verb>
-    aux <word> <participle|bare>                reset <word>
+    word <word> <class>    unword <word>
+      class: pronoun determiner preposition adverb noun conj
+             copula copula-past aux-participle aux-participle-past aux-bare aux-bare-past
     pop                    layers               cache
     fork <name>            switch <name>
 -/
@@ -25,16 +27,26 @@ def words (s : String) : List String :=
   let (cur, out) := s.toList.foldr step ([], [])
   if cur.isEmpty then out else String.ofList cur :: out
 
-def parseClass : String → Option VClass
+def parseVClass : String → Option VClass
   | "strong"     => some .strong
   | "weakIrreg"  => some .weakIrreg
   | "suppletive" => some .suppletive
   | _            => none
 
-def parseSlot : String → Option Slot
-  | "participle" => some .participle
-  | "bare"       => some .bare
-  | _            => none
+def parseWordClass : String → Option WordClass
+  | "pronoun"            => some .pronoun
+  | "determiner"         => some .determiner
+  | "preposition"        => some .preposition
+  | "adverb"             => some .adverb
+  | "noun"               => some .noun
+  | "conj"               => some .conj
+  | "copula"             => some (.copula false)
+  | "copula-past"        => some (.copula true)
+  | "aux-participle"     => some (.aux .participle false)
+  | "aux-participle-past"=> some (.aux .participle true)
+  | "aux-bare"           => some (.aux .bare false)
+  | "aux-bare-past"      => some (.aux .bare true)
+  | _                    => none
 
 structure State where
   name     : String
@@ -43,7 +55,9 @@ structure State where
 
 def help : String :=
   "commands: past V | pp V | check SENTENCE | irregular B P PP CLASS | regular V | retract V\n" ++
-  "          aux W participle|bare | reset W | pop | layers | cache | fork NAME | switch NAME"
+  "          word W CLASS | unword W | pop | layers | cache | fork NAME | switch NAME\n" ++
+  "  CLASS: pronoun determiner preposition adverb noun conj copula copula-past\n" ++
+  "         aux-participle aux-participle-past aux-bare aux-bare-past"
 
 def report (r : Rebased english) : String :=
   let dropped := r.dropped.map (fun e => "  - " ++ showGoal e.goal)
@@ -68,16 +82,19 @@ def handle (st : State) (line : String) : String × State :=
   | ["pp", b]   => askGoal st (.pp b)
   | "check" :: ws => askGoal st (.check (" ".intercalate ws))
   | ["irregular", b, p, pp, c] =>
-    match parseClass c with
+    match parseVClass c with
     | some cls => pushLayer st { name := s!"+irregular {b}", irregulars := [⟨b, p, pp, cls⟩] }
     | none     => ("class must be strong, weakIrreg or suppletive", st)
   | ["regular", b] => pushLayer st { name := s!"+regular {b}", regulars := [b] }
   | ["retract", b] => pushLayer st { name := s!"-{b}", retract := [b] }
-  | ["reset", w]   => pushLayer st { name := s!"+reset {w}", resets := [w] }
-  | ["aux", w, sl] =>
-    match parseSlot sl with
-    | some s => pushLayer st { name := s!"+aux {w}", auxiliaries := [(w, s)] }
-    | none   => ("slot must be participle or bare", st)
+  | ["word", w, c] =>
+    match parseWordClass c with
+    | some wc =>
+      -- adds a class: the new layer lists the word with its current classes plus this one
+      let cur := classesIn st.cur.kb.layers w
+      pushLayer st { name := s!"+{c} {w}", words := [(w, (cur ++ [wc]).eraseDups)] }
+    | none => ("unknown class; see help", st)
+  | ["unword", w] => pushLayer st { name := s!"-word {w}", words := [(w, [])] }
   | ["pop"] =>
     if st.cur.kb.layers.length ≤ 1 then ("refusing to pop the base layer", st)
     else
