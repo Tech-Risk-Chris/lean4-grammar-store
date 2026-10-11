@@ -52,9 +52,16 @@ def formFrom (sel : Irregular → String) (b : String) : Status → Option Strin
 
 /-! ## Word classes -/
 
+/-- The form of a verb token. Tense is a feature of the form, not a word class:
+*was* and *is* are both copulae; *been* and *being* are not finite at all. -/
+inductive VForm where
+  | infinitive | present | past | participle | gerund
+deriving Repr, DecidableEq
+
+/-- A closed-class membership. A word may have several (*had* is past and participle). -/
 inductive WordClass where
-  | aux (s : Slot) (past : Bool)   -- have/has/had, do/does/did
-  | copula (past : Bool)           -- forms of be; open a participle slot
+  | aux (s : Slot) (f : VForm)     -- have/has/had/having, do/does/did
+  | copula (f : VForm)             -- be/am/is/are/was/were/been/being; open a participle slot
   | conj                           -- closes a clause
   | pronoun
   | determiner
@@ -195,19 +202,25 @@ inductive Ans where
   | outOfScope (unknown : List String)
 deriving Repr, DecidableEq
 
-/-- The slot an auxiliary or copula opens, and whether it is itself past. -/
-def auxOf (cs : List WordClass) : Option (Slot × Bool) :=
-  cs.findSome? fun
-    | .aux s p  => some (s, p)
-    | .copula p => some (.participle, p)
+/-- The slot an auxiliary or copula opens, and all the forms the token can be. -/
+def auxOf (cs : List WordClass) : Option (Slot × List VForm) :=
+  let forms := cs.filterMap fun
+    | .aux _ f  => some f
+    | .copula f => some f
     | _         => none
+  let slot := cs.findSome? fun
+    | .aux s _  => some s
+    | .copula _ => some Slot.participle
+    | _         => none
+  slot.map (·, forms)
 
 /-- Left-to-right scan. An auxiliary opens a slot that the next verb fills
 (so inversion works: "did you went"); the verb, or a conjunction, closes it.
 
 A verb form *counts toward scope* if it fills an auxiliary's slot or is not
-the bare base form, i.e. it is past-shaped, right or wrong. A past auxiliary
-left without a verb ("I had the book", "she was happy") counts as well.
+the bare base form, i.e. it is past-shaped, right or wrong. That includes a
+participle auxiliary or copula filling a slot ("have been", "has had"). A past
+auxiliary left without a verb ("I had the book", "she was happy") counts as well.
 
 An ambiguous word is an error only if every verb reading is wrong and it has
 no noun reading. -/
@@ -220,11 +233,12 @@ def checkProg (s : String) : G Ans := do
   for w in tokens s do
     let a ← classifyQ w
     match auxOf a.classes with
-    | some (sl, past) =>
+    | some (sl, fs) =>
       Prog.because (.auxiliary w sl)
-      if pending == some true then sawVerb := true
+      if pending == some true then sawVerb := true                     -- past aux left verbless
+      if pending.isSome && fs.contains .participle then sawVerb := true -- "have been", "has had"
       slot := sl
-      pending := some past
+      pending := some (fs.contains .past)
     | none =>
       if a.classes.contains .conj then
         Prog.because (.boundary w)
@@ -270,9 +284,16 @@ def showAns : Ans → String
     let unk := if us.isEmpty then [] else [s!"unknown: {", ".intercalate us}"]
     "\n".intercalate (["not my expertise: no past or present-perfect verb form found"] ++ hints ++ unk)
 
+def showVForm : VForm → String
+  | .infinitive => "infinitive"
+  | .present    => "present"
+  | .past       => "past"
+  | .participle => "participle"
+  | .gerund     => "gerund"
+
 def showClass : WordClass → String
-  | .aux s p     => (if p then "past " else "") ++ s!"auxiliary ({showSlot s})"
-  | .copula p    => if p then "past copula" else "copula"
+  | .aux s f     => s!"{showVForm f} auxiliary ({showSlot s})"
+  | .copula f    => s!"{showVForm f} copula"
   | .conj        => "conjunction"
   | .pronoun     => "pronoun"
   | .determiner  => "determiner"
@@ -378,12 +399,21 @@ def baseLayer : Layer where
     [ "walk", "stop", "carry", "play", "bake", "visit", "plan", "want", "box", "kick"
     , "fix", "snow", "learn", "dive", "wound" ]
   words :=
-    tagAll (.aux .participle false) ["have", "has", "having"] ++
-    tagAll (.aux .participle true)  ["had"] ++
-    tagAll (.copula false) ["be", "am", "is", "are", "been", "being"] ++
-    tagAll (.copula true)  ["was", "were"] ++
-    tagAll (.aux .bare false) ["do", "does"] ++
-    tagAll (.aux .bare true)  ["did"] ++
+    [ ("have",   [.aux .participle .infinitive, .aux .participle .present])
+    , ("has",    [.aux .participle .present])
+    , ("had",    [.aux .participle .past, .aux .participle .participle])
+    , ("having", [.aux .participle .gerund])
+    , ("be",     [.copula .infinitive])
+    , ("am",     [.copula .present])
+    , ("is",     [.copula .present])
+    , ("are",    [.copula .present])
+    , ("was",    [.copula .past])
+    , ("were",   [.copula .past])
+    , ("been",   [.copula .participle])
+    , ("being",  [.copula .gerund])
+    , ("do",     [.aux .bare .infinitive, .aux .bare .present])
+    , ("does",   [.aux .bare .present])
+    , ("did",    [.aux .bare .past]) ] ++
     tagAll .conj ["and", "but", "then", "or", "no", "yes"] ++
     tagAll .pronoun
       ["i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them",
@@ -415,6 +445,12 @@ example : PastOf [baseLayer] "dive" "dived"             := by decide +kernel
 example : PastOf [usLayer, baseLayer] "dive" "dove"     := by decide +kernel
 example : (formOf Irregular.past "blorf").run (answer [baseLayer]) = none := by decide +kernel
 
+-- Scope, kernel-checked: the present perfect of *be* is in scope, the present is not.
+example : (checkProg "I have been there.").run (answer [baseLayer]) = .checked [] ["there"] := by
+  decide +kernel
+example : (checkProg "She is happy.").run (answer [baseLayer]) = .outOfScope ["happy"] := by
+  decide +kernel
+
 def demo : IO Unit := do
   let mut s := Session.init base
   for sentence in
@@ -427,7 +463,11 @@ def demo : IO Unit := do
       , "The letter was wrote by a student who bringed apples."
       , "They fighted seriously."
       , "They walk home."
-      , "She was happy." ] do
+      , "She was happy."
+      , "She is happy."
+      , "I have been there."
+      , "The book has been writed."
+      , "We have had enough." ] do
     let (e, s') := s.ask (Goal.check sentence)
     s := s'
     IO.println s!"» {sentence}\n{e.render}\n"

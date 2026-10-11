@@ -9,9 +9,10 @@ alone. `serve.py` puts HTTP in front of it.
     past <verb>            pp <verb>            check <sentence>
     irregular <base> <past> <pp> <strong|weakIrreg|suppletive>
     regular <verb>         retract <verb>
-    word <word> <class>    unword <word>
+    word <word> <class> [form]                  unword <word>
       class: pronoun determiner preposition adverb noun conj
-             copula copula-past aux-participle aux-participle-past aux-bare aux-bare-past
+             copula FORM | aux-participle FORM | aux-bare FORM
+      form:  infinitive present past participle gerund
     pop                    layers               cache
     fork <name>            switch <name>
 -/
@@ -33,20 +34,25 @@ def parseVClass : String → Option VClass
   | "suppletive" => some .suppletive
   | _            => none
 
-def parseWordClass : String → Option WordClass
-  | "pronoun"            => some .pronoun
-  | "determiner"         => some .determiner
-  | "preposition"        => some .preposition
-  | "adverb"             => some .adverb
-  | "noun"               => some .noun
-  | "conj"               => some .conj
-  | "copula"             => some (.copula false)
-  | "copula-past"        => some (.copula true)
-  | "aux-participle"     => some (.aux .participle false)
-  | "aux-participle-past"=> some (.aux .participle true)
-  | "aux-bare"           => some (.aux .bare false)
-  | "aux-bare-past"      => some (.aux .bare true)
-  | _                    => none
+def parseVForm : String → Option VForm
+  | "infinitive" => some .infinitive
+  | "present"    => some .present
+  | "past"       => some .past
+  | "participle" => some .participle
+  | "gerund"     => some .gerund
+  | _            => none
+
+def parseWordClass : List String → Option WordClass
+  | ["pronoun"]             => some .pronoun
+  | ["determiner"]          => some .determiner
+  | ["preposition"]         => some .preposition
+  | ["adverb"]              => some .adverb
+  | ["noun"]                => some .noun
+  | ["conj"]                => some .conj
+  | ["copula", f]           => (parseVForm f).map .copula
+  | ["aux-participle", f]   => (parseVForm f).map (.aux .participle)
+  | ["aux-bare", f]         => (parseVForm f).map (.aux .bare)
+  | _                       => none
 
 structure State where
   name     : String
@@ -56,8 +62,9 @@ structure State where
 def help : String :=
   "commands: past V | pp V | check SENTENCE | irregular B P PP CLASS | regular V | retract V\n" ++
   "          word W CLASS | unword W | pop | layers | cache | fork NAME | switch NAME\n" ++
-  "  CLASS: pronoun determiner preposition adverb noun conj copula copula-past\n" ++
-  "         aux-participle aux-participle-past aux-bare aux-bare-past"
+  "  CLASS: pronoun determiner preposition adverb noun conj\n" ++
+  "         copula FORM | aux-participle FORM | aux-bare FORM\n" ++
+  "  FORM:  infinitive present past participle gerund"
 
 def report (r : Rebased english) : String :=
   let dropped := r.dropped.map (fun e => "  - " ++ showGoal e.goal)
@@ -87,12 +94,12 @@ def handle (st : State) (line : String) : String × State :=
     | none     => ("class must be strong, weakIrreg or suppletive", st)
   | ["regular", b] => pushLayer st { name := s!"+regular {b}", regulars := [b] }
   | ["retract", b] => pushLayer st { name := s!"-{b}", retract := [b] }
-  | ["word", w, c] =>
+  | "word" :: w :: c =>
     match parseWordClass c with
     | some wc =>
       -- adds a class: the new layer lists the word with its current classes plus this one
       let cur := classesIn st.cur.kb.layers w
-      pushLayer st { name := s!"+{c} {w}", words := [(w, (cur ++ [wc]).eraseDups)] }
+      pushLayer st { name := s!"+{" ".intercalate c} {w}", words := [(w, (cur ++ [wc]).eraseDups)] }
     | none => ("unknown class; see help", st)
   | ["unword", w] => pushLayer st { name := s!"-word {w}", words := [(w, [])] }
   | ["pop"] =>
